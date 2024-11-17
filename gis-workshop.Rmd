@@ -1,0 +1,1234 @@
+---
+project: Pedestrian route choice
+title: GIS workshop
+author: Andrew Breazeale 
+output: 
+    html_document:
+        toc: TRUE
+        toc_depth: 3
+purpose: To demonstrate map matching and alternative route choice generation for route choice models
+---
+<!-- The following centers the output from the mapview packages -->
+<style>
+    .html-widget {
+        margin: auto;
+    }
+</style>
+
+```{r setup, message=FALSE}
+
+# load required packages 
+library("devtools")   # source_url
+library("knitr")      # kable
+library("mapview")    # mapview method (interactive map)
+library("sf")         # st_buffer, st_intersects, etc. (spatial objects as df)
+library("sfnetworks") # as_sfnetwork, st_network_cost (network as graph object)
+library("tidygraph")  # convert (graph functions)
+library("tidyverse")  # dplyr, ggplot, readr, etc. (simplifying R scripting)
+
+# some additional adjustments 
+knitr::opts_chunk$set(fig.align="center") # center figures when knitting
+options(scipen = 5) # reduce default use of scientific notation
+
+# some of my own personal functions that I use in all code 
+# we only need dictionary()
+source_url("https://raw.githubusercontent.com/arbreazeale/project-scripts/master/projects.R")
+rm(create_paths, get_paths, source_rmd, source_rmd_chunk)
+
+```
+
+# Introduction {#introduction}
+
+Pedestrian route choice modeling is the process of analyzing how individuals choose their walking routes between origin-destination (OD) pairs. 
+By understanding the tradeoffs that exist for pedestrians and pedestrian preferences over different street features, policymakers can better respond to the needs of their constituents. 
+As we understand these things better, we can design the pedestrian environment to improve walking conditions and make walking more desirable (particularly relative to less healthy or environmentally sustainable modes).
+
+In this workshop, we are going to walk through some of the GIS components of pedestrian route choice modeling (specifically *map matching* and *choice set generation*). 
+The methods we discuss here can be expanded to other modes (e.g., bicycling route choice) and the math that we use to evaluate the tradeoffs (i.e., discrete choice multinomial logit) can be expanded to other contexts (e.g., how do people value plazas? parks?). 
+Unfortunately, we likely will not have time to discuss discrete choice models, but I am working on primer that specifically looks at transportation discrete choice modeling in `R` that I will gladly share should anyone wish. 
+
+Before moving on, I would like to provide a brief accessibility note. 
+Throughout this file and my talk, I will be using terms like *walk* and *pedestrian*, which are not meant to be exclusionary to those with different mobility circumstances (e.g., people who use wheelchairs for mobility).
+In the broader data that I am not discussing here, we do capture some information relevant to these New Yorker's experiences, but, unfortunately, it is not enough to make strong statistical claims.
+That is an important limitation of the work that follows. 
+
+# Data {#data}
+
+There are two files that we shall use in this workshop: 
+
+1. An example pedestrian trip taken from the NYC Department of Transportation's (NYC DOT) Citywide Mobility Survey (CMS). 
+2. The pedestrian accessible street network extracted from the NYC Department of City Planning's (NYC DCP) LION Single Line Street Base Map. 
+
+We discuss each of these in turn. 
+
+## Example pedestrian trip {#example}
+
+The CMS is a travel survey periodically conducted by NYC DOT to assess NYC residents' attitudes and preferences over various transportation related issues. 
+The 2019 CMS (from which this example trip was taken) surveyed 3346 respondents from 22 May 2019 through 30 June 2019.
+Of these participants, 2496 respondents provided a week's travel diary via a GPS-enabled smartphone app. 
+It is from one of these participants that this example trip has been taken (with all potentially identifying information removed - e.g., age, race, gender, purpose of trip, assigned ID values).
+For those interested, de-identified versions of the travel survey are available on [NYC Open Data](https://opendata.cityofnewyork.us/). 
+
+The following code imports the pedestrian trip and shows the first few observations. 
+
+```{r import-example}
+
+base_url <- "https://raw.githubusercontent.com/arbreazeale/gis-workshop/refs/heads/main/"
+pedestrian_example <- paste0(base_url, "pedestrian_example.csv")
+pedestrian_example <- read_csv(pedestrian_example)
+kable(head(pedestrian_example))
+
+```
+
+The data need to be converted to a spatial features (`sf`) object, which is one of the key classes for engaging with GIS data in `R`.
+To do this, we need to know the coordinate reference system (CRS) of these data. 
+The consultants who created the smartphone app chose [WGS 84 EPSG:4326](https://epsg.io/4326) for all geospatial data (which is common for online maps like OpenStreetMaps).
+New York State, however, uses [EPSG:2263](https://epsg.io/2263) for all official geospatial data (which includes almost all of the additional attributes that I use in my full analysis). 
+While the choice of CRS is somewhat arbitrary (provided all data use the same system), I want (a) my work to be as directly applicable to practitioners as possible and (b) this workshop to highlight different `R` methods, which means I will use EPSG:2263 for all data. 
+
+The following code converts the pedestrian example into an `sf` object with CRS EPSG:2263. 
+Since EPSG:4326 uses meters for distances and EPSG:2263 uses U.S. survey feet, this also involves updating the accuracy to feet. 
+We then view the trip with an OpenStreetMaps underlay. 
+
+```{r example-to-sf}
+
+# sf objects and transformation 
+track <- pedestrian_example %>% 
+    mutate(gps_accuracy=gps_accuracy*3.2808) %>% # meters to feet 
+    st_as_sf(coords=c("gps_lon", "gps_lat"), crs=4326) %>% # identify x, y, and CRS
+    st_transform(crs=2263) %>% # transform to NYS CRS
+    rename(gps_geometry=geometry) %>% # personal preference on naming convention
+    arrange(gps_datetime) # ensure correct order, will be needed
+
+# show GPS track
+map_track <- mapview(track, cex=4)
+map_track
+```
+
+The following code creates and presents a data dictionary (via my personal `dictionary()` command). 
+As part of this, we store comments that define each variable as an attributes. 
+
+```{r track-dictionary}
+
+# define variables
+comment(track$gps_accuracy) <- "GPS noise estimate: Approximately one standard deviation"
+comment(track$gps_heading) <- "Heading (degrees) recorded by GPS chipset"
+comment(track$gps_speed) <- "Traveling speed (mph) recorded by GPS chipset"
+comment(track$gps_datetime) <- "Date and time for GPS measurement"
+comment(track$gps_geometry) <- "Spatial feature geometry for GPS measurement"
+
+# show dictionary
+kable(dictionary(track))
+
+```
+
+## LION street map {#lion}
+
+The LION Single Line Street Base Map provides a vector representation of the NYC transportation system. 
+These data (available on [NYC Open Data](https://opendata.cityofnewyork.us/)) required some processing to isolate those segments that are pedestrian only (e.g., remove ferry routes, non-pedestrian expressways). 
+These data have already been cleaned (future code will be made available when the project is complete). 
+
+The following code imports the pedestrian network, shows the first few observations, and, if uncommented, shows the map with the OpenStreetMaps underlay (may take some time). 
+While not standard for spatial features, these data are stored in the .RData format (which is a reasonable default storage method for anything `R` related). 
+For those interested in learning more about importing other geospatial data look into the `st_read()` method (via `?st_read`).
+
+```{r import-pedestrian-network}
+
+pedestrian_network <- paste0(base_url, "pedestrian_network.RData")
+load(url(pedestrian_network))
+head(pedestrian_network)
+
+mapview(pedestrian_network)
+
+```
+
+Like before, we consider the data dictionary. 
+Unlike before, all comments have already been added (and retained because of the .RData structure). 
+
+```{r network-dictionary}
+
+kable(dictionary(pedestrian_network))
+
+```
+
+# Map matching {#map-matching}
+
+The map matching process involves a hidden Markov model (HMM) to determine the most likely route taken given GPS pings and the underlying network. 
+The process that we follow here is based on [Newson and Krumm (2009)](https://dl.acm.org/doi/10.1145/1653771.1653818). 
+
+For those familiar with HMMs, we identify the following: 
+
+* The street segments are the *hidden states* (i.e., where the traveler walked, which we do not directly observe).
+* The GPS pings are the *observations*, *symbols*, or *measurements* (i.e., the information about the trip that we observe and which provide insight on the likely hidden states). 
+  Going forward, we shall use exclusively use the term *GPS measurements*. 
+* We calculate *measurement probabilities* (i.e., the likelihood of being in some hidden state given an observation symbol). 
+* We calculate *transition probabilities* (i.e., the likelihood of going from one hidden state to another hidden state). 
+* We assume the Markov property (i.e., the current state contains all information from the previous states and, therefore, is the only state that we must consider when determining the next state). 
+
+For those unfamiliar with HMMs, don't worry - we will walk through map matching the example trip. 
+
+For practical implementation, we use the following steps: 
+
+1. We subset the pedestrian network to include only those segments that may reasonably be considered candidates for the hidden states (called *candidate selection*). 
+2. We estimate the measurement probabilities using distance between the GPS measurement and the candidate segments. 
+   This requires an estimate of GPS noise (i.e., standard deviation). 
+3. We estimate the transition probabilities using the connectedness/distances from the underlying candidate network (restricted to reasonable choices given the GPS measurements). 
+4. We solve for the most likely route using the Viterbi algorithm (to be discussed). 
+
+## Candidate selection {#candidates-selection}
+
+Candidate selection refers to isolating those states/segments that could have emitted a given set of GPS measurements. 
+In principle, every segment in the pedestrian network constitutes a candidate. 
+In practice, including every segment is computationally expensive and unnecessary beyond some point (i.e., it's unlikely that a GPS measurement was emitted in Queens by a person in Staten Island). 
+
+To isolate those segments that are reasonably close to the set of GPS measurements, we: 
+
+1. Define a convex hull for all GPS measurements in the track 
+2. Buffer this hull to ensure all appropriate candidates are selected 
+3. Ensure this buffered hull is routable for map matching and choice set generation 
+
+By doing this, we implicitly assume that any segment outside the buffered convex hull is not a reasonable candidate and, thus, will not be considered as part of the route taken. 
+Another way of stating this: We assume measurement and transition probabilities outside this buffered convex hull are equal to zero. 
+
+### Buffered convex hull {#buffered-convex-hull}
+
+Since the map matching process will be systematically applied to tens of thousands of pedestrian trips, we must develop a systematic method for determining the appropriate buffered convex hull. 
+Because there is little guidance in the literature, I have chosen to use the maximum *great circle distance (GCD)* between consecutive GPS measurements (scaled up to (a) be conservative and (b) ensure the size is sufficient for choice set generation). 
+GCD is approximately the Euclidean distance (approximately because GCD also accounts for the curvature of the earth, which does not matter on small enough scales). 
+
+The following code calculates the GCDs between each consecutive GPS measurement and prints the resulting object. 
+
+```{r gcd}
+
+gcd <- track %>% 
+    mutate(
+        time1 = row_number() - 1, # "time" values help me as a human
+        time2 = row_number(),     # the computer does not require them 
+        gcd = as.numeric(st_distance(gps_geometry, lag(gps_geometry), by_element=TRUE))
+    ) %>% 
+    as_tibble() %>% 
+    select(time1, time2, gcd) %>% 
+    drop_na() # first entry always NA
+
+kable(gcd)
+
+```
+
+The code below uses these GCD values to construct the buffered convex hull around the GPS measurements. 
+We also present a visual aid. 
+
+```{r buffered-convex-hull}
+
+# buffer size 
+buffer <- 1.5*max(gcd$gcd)
+
+# construct buffered convex hull 
+hull <- track %>% 
+    summarise(gps_geometry=st_combine(gps_geometry)) %>% # combine measurements 
+    st_convex_hull() %>% # construct convex hull 
+    st_buffer(buffer) # buffer that hull
+
+# visual 
+map_hull <- mapview(hull)
+map_hull + map_track
+
+```
+
+### Candidate segments {#candidates}
+
+We subset the `pedestrian_network` object to include those segments that intersect the buffered convex hull. 
+The code below performs this manipulation and provides a visual. 
+
+```{r candidate-hull-intersection}
+
+candidates <- as.logical(st_intersects(st_geometry(pedestrian_network), hull, sparse=FALSE))
+candidates <- filter(pedestrian_network, candidates)
+mapview(candidates) + map_track
+
+```
+
+As we can see from the map above, there are many segments on the outer edges of our candidate network that have no real value for map matching or future choice set generation. 
+Unless one wishes to consider routes where people are allowed to double back (which we do not wish to do), any of those "dangling" segments increase computation complexity without adding any real benefit. 
+To address this, we simplify the candidates to remove most of these unnecessary segments. 
+This requires a new structure for the data - one that relies on graph theory. 
+
+Under graph theory, a network is represented by nodes (each given a unique identifier) and edges that connect nodes (also given unique identifiers). 
+Spatial operations can then be performed on either nodes or edges (depending on what one wishes to do). 
+
+In `R`, we use the `sfnetworks` and `tidygraph` packages (which both work well with an underlying package called `igraph`). 
+To activate edges for operations we use `activate("edges")`; to activate nodes we use `activate("nodes")`. 
+To view the graph object, we use the `plot()` method.
+
+The code below converts the candidate network (currently an `sf` object) into an `sf_network` object (i.e., a graph theoretic object). 
+We show the new representation as tables and as a plot. 
+
+```{r candidates-as-graph}
+
+candidates <- candidates %>% as_sfnetwork(directed=FALSE)
+plot(candidates)
+
+# for those interested in the dataframe structure
+candidates
+
+```
+
+To simplify the network (i.e., to remove most of those dangling segments), we use `centrality_degree()`, which is a metric that suggests how important any node is within a network. 
+The code below uses that centrality degree metric to remove those that are not critical. 
+We show the new plot for comparison. 
+
+```{r graph_network}
+
+gph_network <- candidates %>% 
+    activate("nodes") %>% 
+    filter(centrality_degree() > 1)
+plot(gph_network)
+
+```
+
+The resulting graph can be coerced back to an `sf` object and visualized via `mapview()` as follows. 
+
+```{r sf-network}
+
+sf_network <- gph_network %>% 
+    activate("edges") %>% 
+    st_as_sf() 
+map_network <- mapview(sf_network)
+map_network + map_track
+
+```
+
+## Measurement probabilities {#measurement-probabilities}
+
+The *measurement probabilities* (a.k.a. *emission probabilities*) are the likelihoods that a hidden state generates/emits a given measurement. 
+That is, the likelihood our traveler is on a particular segment when we observe some GPS measurement. 
+Intuitively, the further a GPS measurement is from a particular segment, the less likely it is that the person was on that segment when the GPS measurement was emitted. 
+To turn this into a probability in a standardized way, we need an estimate of the error associated with GPS (i.e., the standard deviation of GPS noise). 
+
+### GPS noise {#gps-noise}
+
+In Newson and Krumm (2009), the authors estimate the standard deviation of GPS noise using a scaled median absolute deviation where the deviation is the GCD between the measurement and the nearest point on candidate network and the scalar is 1.4826. 
+We do not need to repeat this calculation because modern chipsets provide a reasonable approximation of GPS accuracy. 
+Android devices report distance (in meters) corresponding to the 68% confidence interval. 
+Assuming measurement error is Gaussian (which is not strictly true, but "this assumption proved effective in our map matching algorithm" (Newson and Krumm (2009), pg. 4)), we can interpret this value as one standard deviation. 
+Apple devices provide a similar distance (in meters) but do not explicitly define the confidence.
+
+Assuming the Apple and Android devices provide similar values, we define the standard deviation for map matching as the median of the accuracy measurements reported (excluding missing values and recording errors, which are stored as -1). 
+The code below implements this. 
+
+```{r sigma}
+
+sigma <- track %>% filter(gps_accuracy > 0) 
+sigma <- median(track$gps_accuracy, na.rm=TRUE)
+
+```
+
+### Calculating measurement probabilities {#calculating-measurement-prob}
+
+As mentioned above, we assume the likelihood of a GPS measurement being emitted from any particular hidden state is a function of distance between the GPS measurement and the segment. 
+For an example, the following code shows the nearest point on each candidate segment for the first GPS measurement. 
+
+```{r}
+
+gps_point <- track[1,]
+nearest1 <- sf_network %>% 
+    mutate(
+        nearest = (
+            st_nearest_points(gps_point, sf_network) %>% # get nearest points
+                st_cast("POINT") %>% # represent as points, not linestring
+                st_difference(gps_point) # remove gps point from nearest
+        )
+    ) %>%
+    as_tibble() %>% 
+    select(network_id, nearest) %>% # isolate nearest geometries
+    st_as_sf() 
+
+mapview(nearest1, cex=4, col.regions="red") + mapview(track[1,], cex=4) + map_network 
+```
+
+As we can see, there is one nearest point for every segment and that nearest point often (but not always) coincides with a node in the candidate network. 
+To estimate the measurement probabilities, we need to make some assumption on the distribution of distance.
+There are multiple ways to do this: 
+
+1. The Newson and Krumm (2009) method assumes GPS noise is a zero mean Gaussian distribution. 
+2. A method developed by researchers at KU Leuven (that may eventually become a paper on map matching with non-emitting states) uses an exponential probability distribution. 
+   The code for their method can be found [here](https://github.com/wannesm/LeuvenMapMatching/blob/master/leuvenmapmatching/matcher/distance.py). 
+3. An exponential decay method used by Simon Scheider and found [here](https://github.com/simonscheider/mapmatching/blob/master/mapmatcher/mapmatcher.py). 
+   The Euclidean exponential decay constant should be parameterized as "distance (in meter [sic]) after which the match probability falls under 0.34" that "depends on the positional error of the track points (how far can points deviate from their true position?)". 
+   We interpret that as corresponding to the same (or similar) sigma value described by Newson and Krumm (2009). 
+
+We use the exponential decay proposed by Simon Scheider (but we include commented out code to allow for exploring the other methods). 
+The code that follows calculates the measurement probabilities for all GPS measurements and all candidate network segments. 
+We print a subset of the underlying matrix where each row is a GPS measurement and each column is the associated network segment. 
+
+```{r measurement-probabilities}
+
+# Euclidean distances between all segment candidates and observed measurements
+# these are all the absolute deviations in accordance with the l2 norm
+# matrix dimensions: gps measurements x candidates
+dist <- st_distance(st_geometry(track), st_geometry(sf_network))
+
+# to avoid "units", we translate this to a "pure" numerical matrix
+# we retain the original dimensions of the matrix where each row corresponds to a measurement 
+#   and each column corresponds to a segment in the network 
+dist <- matrix(as.numeric(dist), nrow=nrow(dist), ncol=ncol(dist))
+colnames(dist) <- sf_network$network_id
+
+# calculate probabilities
+# prob_measurement <- (1/(sigma*sqrt(2*pi)))*exp(-0.5*((dist/sigma)**2)) # Newson-Krumm method
+# prob_measurement <- exp(-0.5*((dist/sigma)**2)) # KU Leuven method 
+prob_measurement <- 1/exp(dist/sigma) # Scheider method
+
+# correct potential divide by zero errors
+prob_measurement[is.na(prob_measurement)] <- 0 
+
+# print 
+prob_measurement[1:5,1:4]
+
+```
+
+## Transition probabilities {#transition-probabilities}
+
+The *transition probabilities* are the likelihoods of progressing from one hidden state to another hidden state. 
+In map matching, the hidden states are the network segments (i.e., the street a person was on when the GPS measurement occurred). 
+To some degree, the further one state is from another state, the lower the likelihood of a transition between those states. 
+However, we cannot use that idea alone since there are non-emitting states (e.g., a person may walk more than one block between GPS measurements). 
+Instead, Newson and Krumm (2009) suggest relating the great circle distance between two GPS measurements and the associated route distances (i.e., distances along the network) because those two are likely to be more similar than not. 
+
+To get this relationship, we must: 
+
+1. Identify the points on the network that are nearest to a GPS measurement within some limit (to reduce computational complexity)
+2. Construct a set of trajectories from each of these nearest points to a each of the nearest points associated with a consecutive GPS measurement (i.e., the *pairwise trajectories*)
+3. Calculate the transition probability associated with each of those pairwise trajectories
+
+This part of the exposition may get confusing, so we should standardize some notation/terminology.
+Let $GPS_1$ be the first GPS measurement in the example trip, $GPS_2$ be the second measurement, and so forth. 
+Let $N_{1,1}$ the first point on the candidate network nearest to $GPS_1$, $N_{1,2}$ be the second point on the candidate network nearest to $GPS_1$, and so forth. 
+In a lot of the discussion to follow, we will be concerned with nearest points on the network for consecutive GPS measurements. 
+That is, we will always be interested trajectories/paths/routes of the form $N_{t, i}$ to $N_{t+1, j}$; we will never skip from $t$ to $t+2$.
+
+With that, we discuss how we determine each of the nearest points on the network. 
+
+### Nearest points redux {#nearest-redux}
+
+In the figure above, we showed every nearest point for each network segment for $GPS_1$. 
+Since there are `r nrow(sf_network)` segments, that means our nearest points go from $N_{1,1}$ to $N_{1,`r nrow(sf_network)`}$. 
+For $GPS_2$, there will be the same number of nearest points (because there are still the same number of segments). 
+
+If we were to find all network paths from those points nearest $GPS_1$ to those points nearest $GPS_2$, there would be `r nrow(sf_network)*nrow(sf_network)` (pairwise) trajectories.
+If we were to find all network paths for each consecutive GPS measurements, then we'd need to find `r nrow(gcd)*nrow(sf_network)*nrow(sf_network)` pairwise trajectories. 
+This is computationally expensive and, given the way the HMM is solved, unnecessary. 
+Instead, we limit our nearest points to those that fall within some reasonable radius of each GPS measurements.
+Since we will need to apply this process multiple times, we construct the following reusable function. 
+
+```{r get-nearest-points}
+
+get_nearest_points <- function(gps_point, network, buffer) {
+# function called within get_pairwise_trajectories 
+# function requires the following inputs: 
+# 1. a single gps measurement (called gps_point)
+# 2. candidate network as sf object (called network)
+# 3. buffer distance in feet (called buffer)
+# function returns an sf object with closest points on nearby network segments
+
+    # simplify warnings
+    # idiosyncratic to sf objects
+    gps_point <- st_geometry(gps_point)
+
+    # nearby segments 
+    # warning suppressed: "attribute variables are assumed to be spatially constant 
+    #   throughout all geometries", which indicates network_id assigned/retained 
+    #   is assumed to be valid
+    suppressWarnings(
+        candidates <- st_intersection(network, st_buffer(gps_point, buffer)) %>% 
+            select(network_id, network_geometry)
+    )
+
+    # nearest points on nearby segments
+    nearest <- candidates %>% 
+        mutate(
+            nearest = (
+                st_nearest_points(gps_point, candidates) %>%
+                    st_cast("POINT") %>% 
+                    st_difference(gps_point)
+                )
+        ) %>% 
+        as_tibble() %>%
+        select(network_id, nearest) %>% 
+        st_as_sf()
+
+    return(nearest)
+}
+
+```
+
+If we assume that GPS error is normally distributed (a common assumption) and that our `sigma` estimate is a reasonable approximation of the standard deviation of GPS error, then a reasonable buffer is three `sigma` (i.e., 95% likely the hidden state captured in the radius). 
+The following code finds the nearest points for $GPS_1$ and provides a visual. 
+To help, we restrict the size of the map to those segments that are most relevant (so we don't have to zoom). 
+
+```{r gps1-nearest}
+
+# network subset 
+# temporary network 
+temp_network <- c(
+    "0070165", "0070166", "0070331", "0070332", "0070333", "0070335", "0070336", "0070337", 
+    "0070338", "0070340", "0070341", "0070342", "0070343", "0070345", "0070351","0070352", 
+    "0070353", "0070354", "0263562", "0263564", "0263565", "9001349", "X0263566" 
+)
+temp_network <- sf_network %>% filter(network_id %in% temp_network)
+
+# gps noise buffer 
+buffer <- 3*sigma
+
+# nearest point to GPS1
+point1 <- track[1,]
+nearest1 <- get_nearest_points(point1, sf_network, buffer)
+point_buffer1 <- st_buffer(point1, buffer)
+
+# visualize
+mapview(point1, cex=4) + 
+    mapview(nearest1, cex=4, col.regions="green") + 
+    point_buffer1 + 
+    temp_network
+
+```
+
+Note: There are `r nrow(nearest1)` nearest points. 
+The reason it looks like fewer has to do with nodes sometimes being chosen more than once. 
+
+### Pairwise trajectories {#pairwise-trajectories}
+
+The *pairwise trajectories* (my term) involves establishing the shortest routes from $N_{t,i}$ to $N_{t+1, j}$ for all $t, i, j$. 
+While doing this involves a loop over all GPS measurements and nearest points, understanding what we are doing is easier if we start with $GPS_1$ and $GPS_2$. 
+
+We saw above all of the nearest points (within some radius) for $GPS_1$. 
+The code that follows shows the nearest points for $GPS_2$ within the same radius (and including all of the nearest points for $GPS_1$). 
+
+```{r gps1-gps2}
+
+# nearest points for GPS2
+point2 <- track[2,]
+nearest2 <- get_nearest_points(point2, sf_network, buffer)
+point_buffer2 <- st_buffer(point2, buffer)
+
+# visualize
+mapview(point1, cex=4) + 
+    mapview(nearest1, cex=4, col.regions="green") + 
+    point_buffer1 + 
+    mapview(point2, cex=4) + 
+    mapview(nearest2, cex=4, col.regions="red") + 
+    point_buffer2 + 
+    temp_network
+
+```
+
+Starting with $N_{1,1}$ to $N_{2,1}$, we do the following: 
+
+1. Isolate the two nearest points on the network. 
+2. Blend the points into the graph object (i.e., create pseudo-nodes for those points). 
+   If we did not do this, the `sf_network` methods would snap to the nearest node. 
+3. Find the shortest path between the two nearest points
+
+The code that follows implements these steps and shows the path in orange. 
+
+```{r n11-to-n21, warning=FALSE}
+
+# nearest points (individual)
+n1 <- nearest1[1,]
+n2 <- nearest2[1,]
+
+# blend into network (i.e., pseudo-nodes for nearest)
+blend <- st_network_blend(gph_network, c(st_geometry(n1), st_geometry(n2))) %>% 
+    activate("edges") %>% 
+    mutate(length=edge_length())
+sf_blend <- blend %>% st_as_sf()
+
+# get shortest path 
+trajectory <- st_network_paths(blend, from=n1, to=n2, weights="length")
+traj <- trajectory$edge_paths %>% unlist()
+traj <- sf_blend[traj,]
+
+# visualize 
+mapview(point1, cex=4) + 
+    mapview(point2, cex=4) + 
+    mapview(n1, cex=4, col.regions="green") + 
+    mapview(n2, cex=4, col.regions="red") + 
+    temp_network + 
+    mapview(traj, color="orange") 
+
+```
+
+We repeat the proces for $N_{1,1}$ to $N_{2,2}$: 
+
+```{r n11-to-n22, warning=FALSE}
+
+# nearest points (individual)
+n1 <- nearest1[1,]
+n2 <- nearest2[2,]
+
+# blend into network (i.e., pseudo-nodes for nearest)
+blend <- st_network_blend(gph_network, c(st_geometry(n1), st_geometry(n2))) %>% 
+    activate("edges") %>% 
+    mutate(length=edge_length())
+sf_blend <- blend %>% st_as_sf()
+
+# get shortest path 
+trajectory <- st_network_paths(blend, from=n1, to=n2, weights="length")
+traj <- trajectory$edge_paths %>% unlist()
+traj <- sf_blend[traj,]
+
+# visualize 
+mapview(point1, cex=4) + 
+    mapview(point2, cex=4) + 
+    mapview(n1, cex=4, col.regions="green") + 
+    mapview(n2, cex=4, col.regions="red") + 
+    temp_network + 
+    mapview(traj, color="orange") 
+
+```
+
+We must do this for all $N_{1,i}$ to $N_{2,j}$. 
+We must then do this for all $N_{2,j}$ to $N_{3,k}$ and so forth. 
+The code that follows does this using loops. 
+
+Note: The `st_network_blend` method mergest the nearest points on a network into the graph as psuedo-nodes. 
+When the nearest point corresponds to a node of the network, the `st_nearest_blend` function will arbitrarily assign the segment associated with that node. 
+This segment as chosen by `sf_network_blend` may not be the one identified via the `get_nearest_points` function. 
+To ensure all segments and nearest points are correctly represented, we include a correction. 
+
+```{r pairwise-trajectories}
+
+# empty tibble for shortest paths and route distances
+trajectories <- tribble(
+    ~time1, ~time2, ~snap1, ~snap2, ~from, ~to, ~route_segments, ~route_distance,
+)
+
+# loop to store all pairwise paths 
+stop_index <- nrow(track)-1
+for (t in 1:stop_index) {
+
+    # nearest points on network to gps measurement 1
+    point1 <- track[t,]
+    nearest1 <- get_nearest_points(point1, sf_network, buffer)
+    if (nrow(nearest1) == 0) {
+        message <- paste("No nearest points for step", t)
+        stop(message)
+    }
+
+    # nearest points on network to gps measurement 1
+    point2 <- track[t+1,]
+    nearest2 <- get_nearest_points(point2, sf_network, buffer)
+    if (nrow(nearest2) == 0) {
+        message <- paste("No nearest points for step", t+1)
+        stop(message)
+    }
+
+    for (i in 1:nrow(nearest1)) {
+
+        n1 <- nearest1[i,]
+
+        for (j in 1:nrow(nearest2)) { 
+
+            n2 <- nearest2[j,]
+
+            # warning suppressed: "attribute variables are assumed to be spatially 
+            #   constant throughout all geometries", which indicates network_id that 
+            #   is assigned/retained is assumed to be valid
+            suppressWarnings(
+                blend <- st_network_blend(gph_network, c(st_geometry(n1),st_geometry(n2))) %>% 
+                    activate("edges") %>% 
+                    mutate(length=edge_length())
+            )
+            sf_blend <- st_as_sf(blend)
+
+            # get shortest path between nearest points n1 and n2
+            trajectory <- st_network_paths(blend, from=n1, to=n2, weights="length")
+
+            # shortest path as sf object
+            traj <- trajectory$edge_paths %>% unlist() 
+            traj <- sf_blend[traj,]
+
+            # route distance
+            route_distance <- as.numeric(sum(st_length(traj)))
+
+            # route traversed 
+            route_segments <- str_flatten(traj$network_id, collapse=",")
+            
+            # # updates when nearest point is a node (as noted in text above)
+            from <- n1$network_id 
+            to <- n2$network_id
+            traj1 <- traj$network_id[1]
+            traj2 <- traj$network_id[nrow(traj)]
+
+            # store trajectories 
+            trajectories <- add_row(trajectories, 
+                time1 = t, 
+                time2 = t+1, 
+                snap1 = i, 
+                snap2 = j, 
+                from = from, 
+                to = to, 
+                route_segments = route_segments, 
+                route_distance = route_distance
+
+            )    
+        }
+    }
+}
+
+kable(head(trajectories, n=20))
+
+```
+
+### Calculating transition probabilities {#calculating-transition-prob}
+
+Like the measurement probabilities above, we found multiple proposed methods to calculate transition probabilities: 
+
+1. The Newson and Krumm (2009) method uses an exponential probability distribution based on the scaled median absolute deviation between GCD and route distances
+2. The Lou et al (2009) method uses a ratio of GCD to route distance
+3. Simon Scheider uses an exponential decay method. 
+   The network exponential decay constant should be paramaterized as "the network distance (in meter [sic]) after which the match probability falls under 0.34" that "depends on the point frequency of the track (how far are track points separated?)".
+   We interpret this paramaterization the same way as the Newson-Krumm parameterization.
+
+The code that follows uses Simon Scheider's method for calculating transition probabilities with the parameterization as described in Newson and Krumm (2009) (i.e., the parameter `beta`). 
+Like before, the other options are included, but commented out. 
+
+```{r transition-probabilities}
+
+# compare route and great circle distances 
+dt <- trajectories %>% 
+    full_join(gcd, by=c("time1", "time2")) %>% 
+    mutate(dt = abs(gcd-route_distance))
+
+# Newson and Krumm (2009) parameterization
+# Note: we used mean to get value unique to time (like Fu, Zhang, Zhang (2021))
+beta <- dt %>% 
+    group_by(time1) %>% 
+    summarise(dt = mean(dt, na.rm=TRUE), .groups="keep") %>%
+    ungroup() 
+beta <- (1/log(2))*median(beta$dt)
+
+# transition probabilities
+# transitions <- dt %>% mutate(transition = (1/beta)*exp(-dt/beta)) # Newson and Krumm
+# transitions <- dt %>% mutate(transition = gcd/route_distance) # Lou et al 
+transitions <- dt %>% mutate(transition = 1/exp(route_distance/beta)) # Scheider
+
+# prefer parsimonious routes
+# slight adjustment to the probabilities that helps with nearest points at nodes
+prob_transition <- transitions %>% 
+    rowwise() %>% 
+    mutate(
+        adjustment = 0.9999**str_count(route_segments,","), 
+        transition = transition*adjustment
+    ) %>% 
+    ungroup() %>% 
+    select(-adjustment)
+
+```
+
+## HMM solution: Viterbi algorithm {#hmm-viterbi}
+
+We solve the HMM using the Viterbi algorithm, which is an efficient dynamic programming solution. 
+The algorithm is separated into two parts: The forward algorithm and the backward algorithm. 
+
+As an aside: The standard Viterbi algorithm cannot handle non-emitting states (e.g., if a person walks three blocks between two GPS measurements, there will be segments that they traversed for which there is no associated measurement). 
+The consensus from the literature appears to be to assume the shortest path when non-emitting states are required. 
+For our implementation, we have effectively done this via finding all pairwise trajectories. 
+That is, instead of assuming the shortest path when we encounter non-emitting states, we have redefined the hidden states to account for that shortest path. 
+
+### Viterbi: The forward algorithm {#hmm-forward}
+
+The forward algorithm involves calculating joint probabilities starting with the first step (from $GPS_1$ to $GPS_2$) then moving onto the next step (from $GPS_2$ to $GPS_3$) and so forth. 
+The probability that we calculate is the product of the measurement probability, the transition probability, and the previous joint probability from all previous steps. 
+In the case of the first step, people often reuse the measurement probability or assume a probability of one - we use the latter. 
+
+Since there are `r max((prob_transition %>% filter(time1==1))$snap1)` nearest points for $GPS_1$ and `r max((prob_transition %>% filter(time1==1))$snap2)` for $GPS_2$, the first step involves calculating `r max((prob_transition %>% filter(time1==1))$snap1)*max((prob_transition %>% filter(time1==1))$snap2)` probabilities. 
+One might think that the number of calculations must then grow exponentially when we move forward, but we can limit the number of calculations going forward by recognizing only the largest probability for each point nearest to $GPS_2$ will be a viable option when taking the next step (keeping ties).  
+The following code shows the calculations and what we retain from the first step between $GPS_1$ and $GPS_2$. 
+
+```{r forward-step-1}
+
+# initial probabilities 
+# common assumption: use measurement probabilities for first point 
+# common assumption: use probability 1 for all first points
+p <- prob_measurement[1,] 
+viterbi <- prob_transition %>% 
+    filter(time1 == 1) %>% 
+    mutate(transition = p[from]*transition) %>% 
+    group_by(to) %>% 
+    filter(transition == max(transition)) %>% 
+    ungroup()
+kable(viterbi)
+```
+
+Note that some of the nearest points associated with $GPS_1$ are not represented, but every nearest point to $GPS_2$ has at least one associated pairwise trajectory (i.e., the most probable). 
+
+Continuing to step forward, the code that follows shows the calculations and what we retain after taking the second step from $GPS_2$ to $GPS_3$. 
+
+```{r forward-step-2}
+
+# measurement probability 
+p <- prob_measurement[2,]
+
+# previous joint probability 
+previous <- viterbi %>% 
+    filter(time1 == 1) %>% 
+    select(to, transition) %>% 
+    rename(from = to, pre=transition) %>% # for merging
+    unique() # duplicate probabilities (map to same node, duplicate point)
+
+# current probabilities 
+current <- prob_transition %>% filter(time1 == 2) 
+    
+# calculate transtition
+# may be many-to-many, so we explicitly allow it 
+update <- full_join(current, previous, by="from", relationship="many-to-many") 
+update <- update %>% 
+    mutate(
+        pre = if_else(is.na(pre), 0, pre), 
+        transition = transition*pre*p[from]
+    ) %>% 
+    group_by(to) %>% 
+    filter(transition == max(transition)) %>% 
+    select(-pre) %>% 
+    ungroup() 
+
+# bind into single dataframe
+viterbi <- bind_rows(viterbi, update) 
+kable(viterbi)
+
+```
+
+Looking at the outcome now, it is clear the path must go through $N_{2,2}$, but that will be captured in the backward algorithm. 
+For now, we complete the forward algorithm for the remaining steps. 
+The code that follows does this. 
+
+```{r forward-remaining-steps}
+
+# viterbi process for second point through end point
+for (t in 3:nrow(track)) { 
+
+    # measurement probability 
+    p <- prob_measurement[t,]
+
+    # previous joint probability 
+    previous <- viterbi %>% 
+        filter(time1 == t-1) %>% 
+        select(to, transition) %>% 
+        rename(from = to, pre=transition) %>% # for merging
+        unique() # duplicate probabilities (map to same node, duplicate point)
+
+    # current probabilities 
+    current <- prob_transition %>% filter(time1 == t) 
+        
+    # calculate transtition
+    # may be many-to-many, so we explicitly allow it 
+    update <- full_join(current, previous, by="from", relationship="many-to-many") 
+    update <- update %>% 
+        mutate(
+            pre = if_else(is.na(pre), 0, pre), 
+            transition = transition*pre*p[from]
+        ) %>% 
+        group_by(to) %>% 
+        filter(transition == max(transition)) %>% 
+        select(-pre) %>% 
+        ungroup() 
+
+    # bind into single dataframe
+    viterbi <- bind_rows(viterbi, update) 
+}
+
+```
+
+### Viterbi: The backward algorithm {#hmm-backward}
+
+The backward algorithm starts from the final step and moves to the first. 
+Looking at the final probabilities, we keep the maximum joint probability for which there is a connecting previous step. 
+That "for which there is a connecting previous step" is an adjustment on the original Newson and Krumm (2009) method to account for higher network density, lower GPS frequency, and non-emitting states. 
+
+The code that follows identifies the nearest point for the final GPS measurement with the highest joint probability.
+That value is presented as the first line of a table. 
+
+```{r backward-step-1}
+
+# setup 
+num_points <- max(viterbi$time2)
+route <- NULL
+
+# current step
+current_step <- viterbi %>% filter(time2 == num_points)
+
+# previous step 
+previous_step <- viterbi %>% filter(time2 == num_points-1)
+
+# adjustment to ensure connectivity 
+# previous$to in current$from
+# current$from in previous$to
+# repeat until no change 
+c1 <- p1 <- 1
+c2 <- p2 <- 2           
+x <- 0 # just in case
+while (c1!=c2 | p1!=p2) {
+    
+    x <- x+1
+    if (x == 10) {stop(paste("Too many iterations in viterbi backward"))}
+
+    # nrow at start of pass
+    c1 <- nrow(current_step)
+    p1 <- nrow(previous_step)
+
+    # apply filter
+    current_step <- current_step %>% filter(from %in% previous_step$to)
+    previous_step <- previous_step %>% filter(to %in% current_step$from)
+
+    # nrow at end of pass
+    c2 <- nrow(current_step)
+    p2 <- nrow(previous_step)
+}
+
+# select max probability 
+current_step <- current_step %>% filter(transition == max(transition))
+
+# route
+route <- bind_rows(route, current_step)
+kable(route)
+```
+
+For the next backward step, we use the same idea, but we include a check to ensure that the "current step" accords with the steps determined before and after. 
+The following code takes the next backward step and presents the updated table. 
+
+```{r backward-step-2}
+
+t <- num_points-1
+
+# current step 
+current_step <- viterbi %>% filter(time2 == t)
+
+# get previous step 
+previous_step <- viterbi %>% filter(time2 == t-1)
+
+# previous$to in current$from
+# current$from in previous$to
+# repeat until no change 
+c1 <- p1 <- 1
+c2 <- p2 <- 2           
+x <- 0 # just in case
+while (c1!=c2 | p1!=p2) {
+    
+    x <- x+1
+    if (x == 10) {stop(paste("Too many iterations in viterbi backward"))}
+
+    # nrow at start of pass
+    c1 <- nrow(current_step)
+    p1 <- nrow(previous_step)
+
+    # apply filter
+    current_step <- current_step %>% filter(from %in% previous_step$to)
+    previous_step <- previous_step %>% filter(to %in% current_step$from)
+
+    # nrow at end of pass
+    c2 <- nrow(current_step)
+    p2 <- nrow(previous_step)
+}
+
+# current step in next step 
+next_step <- route %>% filter(time2 == t+1)
+current_step <- current_step %>% 
+    filter(to %in% next_step$from) %>% 
+    filter(transition == max(transition))
+
+# route 
+route <- bind_rows(route, current_step)
+kable(route)
+```
+
+We repeat the process until we arrive at the route. 
+
+```{r backward-remaining-steps}
+
+step <- num_points-2 
+for (t in step:2) {
+
+        # current step 
+        current_step <- viterbi %>% filter(time2 == t)
+
+        # previous step (if t != 2)
+        # only consider those options where the previous$to == current$from (both directions)
+        # forward algorithm only keeps max prob by "to" segment 
+        # this may mean some "from" segments are dropped
+        # checking this existence ensures connected routes
+        if (t > 2) {
+            
+            # get previous step 
+            previous_step <- viterbi %>% filter(time2 == t-1)
+
+            # previous$to in current$from
+            # current$from in previous$to
+            # repeat until no change 
+            c1 <- p1 <- 1
+            c2 <- p2 <- 2           
+            x <- 0 # just in case
+            while (c1!=c2 | p1!=p2) {
+                
+                x <- x+1
+                if (x == 10) {stop(paste("Too many iterations in viterbi backward"))}
+
+                # nrow at start of pass
+                c1 <- nrow(current_step)
+                p1 <- nrow(previous_step)
+
+                # apply filter
+                current_step <- current_step %>% filter(from %in% previous_step$to)
+                previous_step <- previous_step %>% filter(to %in% current_step$from)
+
+                # nrow at end of pass
+                c2 <- nrow(current_step)
+                p2 <- nrow(previous_step)
+            }
+        }
+
+        # max probability of current step 
+        # if iteration before current step, simply take max transition
+        # if iteration before current step, ensure connectivity, then take max transition
+        if (t == num_points) { 
+            current_step <- current_step %>% filter(transition == max(transition))
+        } else {
+            next_step <- route %>% filter(time2 == t+1)
+            current_step <- current_step %>% 
+                filter(to %in% next_step$from) %>% 
+                filter(transition == max(transition))
+        }
+
+        # error if no observations
+        if (nrow(current_step) == 0) {stop(paste("No backward options at step from", t))}
+        if (nrow(previous_step) == 0) {stop(paste("No backward options from step", t, "to", t-1))}
+
+        # combine
+        route <- bind_rows(route, current_step)
+
+}
+
+# order
+# no longer need from, to, snap1, snap2
+# the unique() handles cases when route unchanged but two nodes selected
+route <- route %>% 
+    arrange(time1, time2) %>% 
+    select(-from, -to, -snap1, -snap2) %>%
+    unique()
+
+kable(route)
+
+```
+
+### Simplification and adjustments {#simplification-adjustments}
+
+Looking at the output, we can see that there are parts of the route that we should simplify (e.g., X0313857 is chosen multiple times). 
+In this section, we simplify the route structure to include each segment once (but retaining the order). 
+The following code simplifies the route and presents the map. 
+
+```{r simplify-route}
+
+# relevant fields 
+df <- route %>% select(time1, time2, route_segments)
+
+# expand route 
+complete_route <- NULL
+for (t in 1:nrow(df)) {
+
+    row <- df[t,]
+    segs <- str_split_1(row$route_segments[1], ",")
+    complete_route <- append(complete_route, segs)
+
+}    
+complete_route <- complete_route %>% as_tibble() %>% rename(network_id=value)
+
+# simplify route step-by-step
+# we want to ensure (a) order is preserved and (b) potential duplicate ids captured
+# therefore we cannot use `unique`
+seg_previous <- "XXXXXXXX"
+simplified_route <- tibble(network_id=as.character())
+for (t in 1:nrow(complete_route)) { 
+
+    seg <- complete_route$network_id[t]
+    if (seg == "" | seg==seg_previous) {
+        next
+    } else if (seg != seg_previous) {
+        simplified_route <- bind_rows(simplified_route, tibble(network_id = seg))
+        seg_previous <- seg
+    } else {
+        stop("Error in remove duplicates")
+    }
+
+}
+
+route <- inner_join(simplified_route, sf_network, by="network_id") %>% st_as_sf()
+map_route <- mapview(route, color="orange")
+map_track + map_network + map_route
+
+```
+
+For this example, there are no additional adjustments that need to be made.
+However, when looping over thousands of trips, we often find idiosyncratic issues that we wish to check before concluding that our mapped routes are correct. 
+For example, we would want to check for unnecessary diversions in the route, which might suggest additional stops that were made but not correctly captured by the smartphone app. 
+
+# Choice set generation 
+
+For *choice set generation*, we wish to determine "reasonable" alternative paths that the person could have taken for the same OD pair. 
+In the literature, there exist many ways to define reasonable, but most involve heuristic limits (e.g., limit the number of turns, limit the length relative to the trip taken).
+Others also include maximizing/minimizing attributes of the route within those limits (e.g., tree coverage, distance, turns).  
+
+One way to approach the problem is to generate all simple (i.e., non-circuitous) paths between OD pairs and then restrict those options based on the heuristics. 
+Unfortunately, the search algorithm that generates all simple paths takes way too long for this workshop. 
+Instead, we shall use a randomized process that is much faster (while still illustrating the ideas). 
+
+In the following code, we: 
+
+1. Identify the shortest route from origin node to destination node 
+2. Randomly reassign the distances for each segment using a uniform distribution bounded by the range of observations
+3. Find the new "shortest" route using those randomly assigned distances
+
+We slightly speed up the process by ensuring only newly generated routes are retained. 
+The following code implements the choice set generation procedure and presents some of the table of alternatives. 
+
+```{r choice-set-generation}
+
+# number of iterations 
+iterations <- 100
+
+# segment lengths in network 
+gph_network <- gph_network %>% 
+    activate("edges") %>% 
+    mutate(segment_length = as.numeric(edge_length()))
+sf_network <- gph_network %>% st_as_sf()
+
+# weighting works using a separate vector object
+# min and max weights for uniform distribution
+weight <- sf_network$segment_length
+max_weight <- max(weight)
+min_weight <- min(weight)
+
+# origin-destination nodes
+# getting the node ids
+if (route[1,]$from==route[2,]$from) {
+    pt1 <- route[1,]$to
+} else {
+    pt1 <- route[1,]$from
+}
+
+n <- nrow(route)
+if (route[n,]$from == route[n-1,]$from) {
+    pt2 <- route[n,]$to
+} else {
+    pt2 <- route[n,]$from
+}
+
+# loop to construct choice set 
+alternatives <- NULL 
+for (x in 1:iterations) { 
+
+    # shortest route 
+    traj <- st_network_paths(gph_network, from=pt1, to=pt2, weights=weight)
+    nodes <- unlist(traj$node_paths)
+    edges <- unlist(traj$edge_paths)        
+
+    # get alternate routes
+    alt <- as_tibble(gph_network)[edges,]
+    alt_route <- str_flatten(alt$network_id, collapse=",")
+
+    # if alternative not already generated, store alternative
+    if (!(alt_route %in% alternatives$route)) { 
+        alt <- tibble(iteration = x, route = alt_route)
+        alternatives <- bind_rows(alternatives, alt)
+    }
+
+    # reassign weights  
+    weight <- runif(length(weight), min_weight, max_weight)
+}
+
+head(alternatives)
+```
+
+To visualize some of these alternatives, we find it best to create a function that can extract the route as stored and return the appropriate `sf` object. 
+The code that follows does this and presents the first two alternatives that were generated. 
+
+```{r extract-route}
+
+extract_route <- function(route, network) {
+# function requires the following inputs 
+# 1. the string of network IDs for the route to be extracted (called route)
+# 2. the pedestrian network as an sf object (called network) 
+# function returns an sf object with the (ordered) route and network features
+
+    # separate route string 
+    route <- tibble(network_id:=str_split(route, ",")[[1]])
+
+    # get network features and assign order
+    route <- route %>% 
+        mutate(order=row_number()) %>% 
+        relocate(order) %>% 
+        left_join(network, by="network_id") %>% 
+        st_as_sf()
+
+    return(route)
+
+}
+
+r1 <- extract_route(alternatives[1,]$route, sf_network)
+r2 <- extract_route(alternatives[2,]$route, sf_network)
+
+map_route + mapview(r1, color="green") + mapview(r2, color="red")
+```
+
+For each of these alternatives, we must determine values for the attributes that we have chosen to include in our model. 
+For the full model that, this includes things like distance, number of turns, weather, time of day, demographics, tree coverage, presence of scaffolding, and so forth (i.e., we use a lot of data). 
+For this example, we have four attributes that could be included: distance, sidewalk width, street width, and whether step streets are present. 
+
+In the following code, we construct the choice set using route distance, average sidewalk width (weighted by segment legnth), average street width (weighted by segment legnth), and count of step streets. 
+As part of this, we must also check if (a) the route actually chosen exists in the list of alternatives and (b) if it does not, we must include that as an alternative. 
+
+```{r get-attributes}
+
+# include route chosen if necessary
+route_chosen <- str_flatten(route$network_id, collapse=",")
+route_chosen_generated <- as.numeric(route_chosen %in% alternatives$route)
+if (route_chosen_generated == 1) {
+    alternatives <- alternative %>% 
+        mutate(chosen = if_else(route==route_chosen, 1, 0))
+} else { 
+    add_route <- tibble(
+        iteration = 0, 
+        route = route_chosen, 
+        chosen = 1
+    )
+    alternatives <- bind_rows(alternatives, add_route) %>% 
+        replace_na(list(chosen = 0))
+}
+
+
+# attributes for alternatives 
+num_alternatives <- nrow(alternatives)
+choice_set <- NULL
+for (alt in 1:num_alternatives) {
+
+    i <- alternatives$iteration[alt]
+    r <- extract_route(alternatives[alt,]$route, sf_network)
+    r <- r %>% 
+        as_tibble() %>% 
+        mutate(
+            weight = segment_length/sum(segment_length), 
+            street_width = weight*street_width, 
+            sidewalk_width = weight*sidewalk_width
+        ) %>% 
+        summarise(
+            route_distance = sum(segment_length), 
+            street_width = sum(street_width), 
+            sidewalk_width = sum(sidewalk_width), 
+            step_streets = sum(flag_steps)
+        ) %>% 
+        mutate(iteration = i)
+    choice_set <- bind_rows(choice_set, r)
+
+}
+choice_set <- inner_join(alternatives, choice_set, by="iteration")
+head(choice_set)
+```
+
