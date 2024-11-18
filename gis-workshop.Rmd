@@ -33,7 +33,7 @@ options(scipen = 5) # reduce default use of scientific notation
 # some of my own personal functions that I use in all code 
 # we only need dictionary()
 source_url("https://raw.githubusercontent.com/arbreazeale/project-scripts/master/projects.R")
-rm(create_paths, get_paths, source_rmd, source_rmd_chunk)
+rm(create_paths, get_paths, source_rmd, source_rmd_chunk, shelltidy)
 
 ```
 
